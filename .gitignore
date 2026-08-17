@@ -1,0 +1,16 @@
+# ===== Runtime log (contains personal run info, regenerated on each run) =====
+checkin.log
+checkin.log.old
+
+# ===== Python cache =====
+__pycache__/
+
+# ===== WorkBuddy workspace memory (private) =====
+.workbuddy/
+
+# ===== Leftover test artifacts =====
+.task_event.xml
+
+# ===== OS / editor noise =====
+.DS_Store
+Thumbs.db
