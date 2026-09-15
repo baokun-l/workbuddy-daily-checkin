@@ -16,7 +16,6 @@
 │  │   └── 签到 API:                                        │
 │  │       POST /v2/billing/meter/checkin-activity-status  │ ← 查询签到状态
 │  │       POST /v2/billing/meter/daily-checkin            │ ← 领取每日积分
-│  │       POST /v2/auth/token/refresh                     │ ← 刷新 token
 │  │                                                        │
 │  ├── auth 文件 (登录凭证)                                 │
 │  │   %LOCALAPPDATA%/CodeBuddyExtension/Data/Public/auth/ │
@@ -29,13 +28,19 @@
 
 ### 认证机制
 - **accessToken**: JWT 格式，有效期 60 天，存在本地 auth 文件中
-- **refreshToken**: 有效期 90 天，用于 token 过期后刷新
+- **过期时间**: 优先读 auth 文件中的 `expiresAt`（毫秒时间戳）
 - **请求头**: `Authorization: Bearer <token>` + `X-User-Id: <uid>`
 - WorkBuddy 客户端运行时会自动刷新 token 并写回文件
 
+> **关于 token 刷新**: 早期版本的脚本会自行调用 `/v2/auth/token/refresh`
+> 刷新 token，但该接口在服务端已下线（实测多个候选路径均返回
+> `404 Route Not Found`）。因此脚本不再尝试自行刷新，改为**依赖
+> WorkBuddy 客户端刷新 token**。accessToken 有效期内脚本可正常工作；
+> 若 token 真的过期，请打开客户端重新登录以重建 auth 文件。
+
 ### 脚本逻辑
 1. 从本地 auth 文件读取最新的 accessToken（每次运行都读，确保拿到最新 token）
-2. 检查 token 是否过期，过期则用 refreshToken 自动刷新
+2. 读取 `expiresAt` 判断 token 是否过期，过期则提示重新登录
 3. 查询签到状态，如果今天未签到则自动领取
 4. 记录运行日志到 `checkin.log`
 
@@ -110,9 +115,10 @@ Unregister-ScheduledTask -TaskName "WorkBuddy每日签到" -Confirm:$false
 1. **需要先登录**: 首次使用前，必须打开 WorkBuddy 桌面客户端并登录账号，
    这样才会生成 auth 文件。脚本从该文件读取登录凭证。
 
-2. **Token 过期**: accessToken 有效期 60 天。脚本会自动用 refreshToken 刷新。
-   但 refreshToken 有效期 90 天，如果超过 90 天没打开 WorkBuddy 客户端，
-   需要重新登录。建议偶尔打开一下客户端保持登录状态。
+2. **Token 过期**: accessToken 有效期 60 天。脚本不再自行刷新 token
+   （服务端刷新接口已下线），依赖 WorkBuddy 客户端刷新并写回 auth 文件。
+   因此**建议偶尔打开一下客户端**保持登录状态；若 token 过期且未刷新，
+   脚本会提示你重新登录。
 
 3. **签到规则**: 每天可领 100 积分，连续签到有额外奖励。每天只能领一次。
 

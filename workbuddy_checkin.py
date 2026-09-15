@@ -6,7 +6,6 @@ WorkBuddy 每日积分自动领取脚本
   通过逆向 WorkBuddy 桌面客户端 (Electron app.asar)，找到签到领积分的 API：
     1. 查询签到状态: POST https://copilot.tencent.com/v2/billing/meter/checkin-activity-status
     2. 领取每日积分: POST https://copilot.tencent.com/v2/billing/meter/daily-checkin
-    3. 刷新 token:   POST https://copilot.tencent.com/v2/auth/token/refresh
 
   认证方式:
     - Authorization: Bearer <accessToken>  (JWT, 60天有效期)
@@ -15,9 +14,15 @@ WorkBuddy 每日积分自动领取脚本
 
   脚本逻辑:
     1. 从本地 auth 文件读取 accessToken（每次运行都读最新的）
-    2. 如果 token 已过期，用 refreshToken 刷新
+    2. 读取 auth 文件中的 expiresAt 判断是否过期；过期则提示重新登录
     3. 查询签到状态，如果今天未签到则自动领取
     4. 记录日志
+
+  关于 token 刷新:
+    旧版本此脚本会调用 /v2/auth/token/refresh 自行刷新 token，但该接口
+    在服务端已下线（实测多个候选路径均返回 404 Route Not Found）。
+    因此脚本不再尝试自行刷新，改为依赖 WorkBuddy 客户端刷新 token；
+    若 token 已过期，脚本会明确提示打开客户端重新登录。
 
 用法:
     python workbuddy_checkin.py            # 执行一次签到
@@ -69,7 +74,6 @@ AUTH_FILE = os.path.join(
 ENDPOINT = "https://copilot.tencent.com"
 STATUS_API = "/v2/billing/meter/checkin-activity-status"
 CHECKIN_API = "/v2/billing/meter/daily-checkin"
-REFRESH_API = "/v2/auth/token/refresh"
 
 # 日志文件
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -153,27 +157,60 @@ def validate_session(session):
 
 
 def decode_jwt_exp(token):
-    """解码 JWT token，返回过期时间 (datetime)"""
+    """解码 JWT token，返回过期时间 (datetime)。
+
+    关键点：JWT 的 header/payload 按 RFC 7519 使用 base64url 编码，
+    其字母表包含 '-' 和 '_'。实际 token 的 payload 中确实出现了 '_'，
+    而标准 base64 字母表不含 '_'，用 base64.b64decode 会把 '_' 静默
+    当作普通字符处理，解出错误字节，最终在 json.loads 处抛
+    UnicodeDecodeError。因此必须使用 urlsafe_b64decode。
+
+    填充用 -len % 4 而非 4 - len % 4：后者在长度恰为 4 的倍数时会
+    多补 4 个 '='，属于边界隐患。对本 token（长度正好是 4 的倍数）
+    两者结果相同，但保留正确写法以防将来 token 长度变化。
+    """
     try:
         parts = token.split(".")
         if len(parts) < 2:
             return None
-        payload = parts[1] + "=" * (4 - len(parts[1]) % 4)
-        data = json.loads(base64.b64decode(payload))
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)  # 正确的 base64url 填充
+        data = json.loads(base64.urlsafe_b64decode(payload))
         exp = data.get("exp")
         if exp:
+            # exp 是 NumericDate（整型秒），fromtimestamp 直接可用
             return datetime.datetime.fromtimestamp(exp)
         return None
     except Exception:
         return None
 
 
-def is_token_expired(token, skew_seconds=300):
-    """检查 token 是否过期（预留 5 分钟缓冲）"""
-    exp = decode_jwt_exp(token)
+def get_token_expiry(session):
+    """获取 access token 过期时间。
+
+    优先使用 auth 文件中的 expiresAt（毫秒时间戳，最可靠），
+    其次回退到解析 JWT 的 exp 字段。返回 datetime 或 None。
+    """
+    auth = session.get("auth", {})
+    expires_at = auth.get("expiresAt")
+    if isinstance(expires_at, (int, float)) and expires_at > 0:
+        try:
+            return datetime.datetime.fromtimestamp(expires_at / 1000.0)
+        except Exception:
+            pass
+    return decode_jwt_exp(auth.get("accessToken", ""))
+
+
+def is_token_expired(session, skew_seconds=300):
+    """检查 access token 是否过期（预留 5 分钟缓冲）。
+
+    无法判定过期时间时按“未过期”处理：宁可让服务端返回 401 再处理，
+    也不要因为解析失败而误判为过期、触发不必要的刷新。
+    """
+    exp = get_token_expiry(session)
     if not exp:
-        log("无法解码 token 过期时间，假设已过期", "WARN")
-        return True
+        log("无法判定 token 过期时间，按未过期处理", "WARN")
+        return False
     now = datetime.datetime.now()
     if now >= (exp - datetime.timedelta(seconds=skew_seconds)):
         return True
@@ -252,71 +289,6 @@ def build_headers(session):
     if domain:
         headers["X-Domain"] = domain
     return headers
-
-
-def _persist_auth(session, auth_path):
-    """只写回 auth token 字段，并先合并磁盘最新内容，降低并发覆盖风险。
-
-    风险说明：WorkBuddy 客户端可能同时写同一 auth 文件。若整文件覆盖，
-    会用旧快照覆盖客户端刚写入的其他字段。这里改为：重新读取磁盘最新
-    内容 -> 仅更新 token 相关字段 -> 原子替换，从而保留其他字段。
-    """
-    try:
-        latest = {}
-        try:
-            with open(auth_path, "r", encoding="utf-8") as f:
-                latest = json.load(f)
-        except Exception:
-            latest = session  # 读取失败则用内存中的 session
-        if not isinstance(latest.get("auth"), dict):
-            latest["auth"] = {}
-        latest["auth"]["accessToken"] = session["auth"]["accessToken"]
-        if "refreshToken" in session["auth"]:
-            latest["auth"]["refreshToken"] = session["auth"]["refreshToken"]
-        if "expiresIn" in session["auth"]:
-            latest["auth"]["expiresIn"] = session["auth"]["expiresIn"]
-        tmp = Path(str(auth_path) + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(latest, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, auth_path)  # 原子替换，避免半写文件
-        log("已将新 token 写回 auth 文件")
-    except Exception as e:
-        log(f"写回 auth 文件失败（不影响本次签到）: {e}", "WARN")
-
-
-def refresh_token(session, auth_path):
-    """使用 refreshToken 刷新 accessToken，返回新的 session 或 None"""
-    log("token 已过期，尝试刷新...")
-    refresh_token_val = session["auth"].get("refreshToken", "")
-    if not refresh_token_val:
-        log("无 refreshToken，请打开 WorkBuddy 客户端重新登录", "ERROR")
-        return None
-
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {session['auth']['accessToken']}",
-        "Content-Type": "application/json",
-        "X-User-Id": session["account"]["uid"],
-        "X-Refresh-Token": refresh_token_val,
-        "X-Auth-Refresh-Source": "plugin",
-    }
-
-    status, resp = make_request(f"{ENDPOINT}{REFRESH_API}", headers)
-
-    if status == 200 and resp.get("code") == 0 and resp.get("data"):
-        new_auth = resp["data"]
-        log("token 刷新成功")
-        session["auth"]["accessToken"] = new_auth.get("accessToken", session["auth"]["accessToken"])
-        if "refreshToken" in new_auth:
-            session["auth"]["refreshToken"] = new_auth["refreshToken"]
-        if "expiresIn" in new_auth:
-            session["auth"]["expiresIn"] = new_auth["expiresIn"]
-        _persist_auth(session, auth_path)
-        return session
-    else:
-        log(f"token 刷新失败: HTTP {status}, {json.dumps(resp, ensure_ascii=False)[:300]}", "ERROR")
-        log("请打开 WorkBuddy 客户端重新登录", "ERROR")
-        return None
 
 
 def get_checkin_status(session):
@@ -413,16 +385,15 @@ def main():
         log(f"当前用户: {nickname} (uid: {uid})")
 
         # 2. 检查 token 是否过期
-        token = session["auth"]["accessToken"]
-        exp = decode_jwt_exp(token)
+        exp = get_token_expiry(session)
         if exp:
             log(f"token 过期时间: {exp.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        if is_token_expired(token):
-            session = refresh_token(session, auth_path)
-            if session is None:
-                log("无法刷新 token，退出", "ERROR")
-                sys.exit(1)
+        if is_token_expired(session):
+            # 服务端刷新接口已下线，脚本不再自行刷新。
+            # 但仍继续尝试：无法判定过期时间时会走到这里，token 可能实际有效。
+            log("token 可能已过期，但服务端刷新接口已下线（历史版本返回 404）", "WARN")
+            log("将继续使用现有 accessToken 尝试；若返回 401 请打开 WorkBuddy 客户端重新登录", "WARN")
 
         # 3. 查询签到状态
         log("正在查询签到状态...")
