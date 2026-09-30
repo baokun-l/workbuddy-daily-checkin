@@ -28,10 +28,22 @@
 ```
 
 ### 认证机制
-- **accessToken**: JWT 格式，有效期 60 天，存在本地 auth 文件中
-- **refreshToken**: 有效期 90 天，用于 token 过期后刷新
+- **accessToken**: JWT 格式，存在本地 auth 文件中
+- **refreshToken**: 用于 token 过期后刷新
 - **请求头**: `Authorization: Bearer <token>` + `X-User-Id: <uid>`
 - WorkBuddy 客户端运行时会自动刷新 token 并写回文件
+
+> **凭据来源（2026-09 客户端更新后重要）**
+>
+> 新版客户端会把 `workbuddy-desktop.info` 的敏感字段用 AES-GCM 信封加密，
+> 形如 `{"$wbEncrypted":1,"envelope":"..."}`，第三方脚本无法解密。
+> 因此本脚本按优先级读取凭据：
+>
+> 1. `Tencent-Cloud.coding-copilot.info`（同账号、**明文**，CodeBuddy 插件写入）—— 首选
+> 2. `workbuddy-desktop.info`（仅在字段仍为明文时可用）—— 回退
+>
+> 两者都位于 `%LOCALAPPDATA%/CodeBuddyExtension/Data/Public/auth/`。
+> 若两处都变成加密格式，脚本会给出明确报错，而不是抛出难以理解的异常。
 
 ### 脚本逻辑
 1. 从本地 auth 文件读取最新的 accessToken（每次运行都读，确保拿到最新 token）
@@ -109,6 +121,8 @@ Unregister-ScheduledTask -TaskName "WorkBuddy每日签到" -Confirm:$false
 
 1. **需要先登录**: 首次使用前，必须打开 WorkBuddy 桌面客户端并登录账号，
    这样才会生成 auth 文件。脚本从该文件读取登录凭证。
+   若脚本报「accessToken 已被客户端加密」，说明客户端升级引入了字段加密；
+   此时确认 `Tencent-Cloud.coding-copilot.info` 存在且为明文即可（打开 CodeBuddy 插件会重建它）。
 
 2. **Token 过期**: accessToken 有效期 60 天。脚本会自动用 refreshToken 刷新。
    但 refreshToken 有效期 90 天，如果超过 90 天没打开 WorkBuddy 客户端，
