@@ -43,6 +43,7 @@ WorkBuddy 每日积分自动领取脚本
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import base64
@@ -101,6 +102,16 @@ TOKEN_CACHE_FILE = SCRIPT_DIR / "wb_token_cache.json"
 
 # 客户端进程名（内存提取用）
 CLIENT_EXE = "WorkBuddy.exe"
+
+# 客户端可执行文件候选路径（缓存失效且客户端未运行时，尝试自动拉起）
+CLIENT_EXE_CANDIDATES = [
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "WorkBuddy", "WorkBuddy.exe"),
+    os.path.join(os.environ.get("PROGRAMFILES", ""), "WorkBuddy", "WorkBuddy.exe"),
+    r"D:\Users\刘宝杰\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe",
+]
+
+# 缓存 token 剩余有效期低于该天数时，优先从客户端内存换新 token（让缓存持续向前滚动）
+CACHE_REFRESH_MARGIN_DAYS = 10
 
 # 请求超时（秒）
 TIMEOUT = 20
@@ -514,12 +525,84 @@ def claim_daily_checkin(token, uid, domain):
 # 凭据解析：找出一个真正可用的 token
 # ============================================================
 
-def resolve_credentials():
+def cache_remaining_days(cache):
+    """返回缓存 token 剩余有效天数；无法判断返回 None"""
+    if not cache:
+        return None
+    exp = cache.get("expiresAt")
+    if not exp:
+        return None
+    try:
+        return (float(exp) / 1000.0 - time.time()) / 86400.0
+    except Exception:
+        return None
+
+
+def _attempt(tokens, uid, domain):
+    """依次实测 token，命中返回 (token, status_data, source)，否则 None"""
+    for token, source in tokens:
+        data = probe_token(token, uid, domain)
+        if data:
+            log(f"token 可用（来源: {source}）")
+            save_token_cache(token, uid, source)
+            return token, data, source
+        log(f"token 不可用（来源: {source}），换下一个", "WARN")
+    return None
+
+
+def _attempt_from_memory(uid, domain):
+    """从客户端进程内存提取并实测 token"""
+    tokens = scan_client_memory_for_tokens()
+    if not tokens:
+        return None
+    return _attempt([(t, "客户端进程内存") for t in tokens], uid, domain)
+
+
+def try_launch_client(wait_seconds=60):
+    """客户端未运行时尝试拉起，以便从内存提取 token。
+
+    仅在所有凭据都失效时调用；可用 --no-launch 关闭该行为。
+    """
+    if "--no-launch" in sys.argv:
+        log("已指定 --no-launch，跳过自动拉起客户端")
+        return False
+    if enum_processes_by_name(CLIENT_EXE):
+        return True
+    exe = next((p for p in CLIENT_EXE_CANDIDATES if p and os.path.exists(p)), None)
+    if not exe:
+        log("未找到 WorkBuddy.exe，无法自动拉起客户端", "WARN")
+        return False
+    try:
+        log(f"WorkBuddy 客户端未运行，尝试自动启动以提取 token：{exe}")
+        subprocess.Popen([exe], close_fds=True)
+    except Exception as e:
+        log(f"启动客户端失败: {e}", "WARN")
+        return False
+
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        time.sleep(5)
+        if enum_processes_by_name(CLIENT_EXE):
+            log("客户端已启动，等待其初始化后重新提取...")
+            time.sleep(8)   # 给客户端留出加载与刷新 token 的时间
+            return True
+    log("等待客户端启动超时", "WARN")
+    return False
+
+
+def resolve_credentials(force_refresh=False):
     """返回 (token, uid, domain, status_data, source)。
 
-    依次尝试：本地缓存 -> 明文凭据文件 -> 客户端进程内存。
-    每个候选都用状态接口实测，只有真正可用的才会被采纳并写入缓存。
+    解析顺序（每个候选都用状态接口实测，取第一个真正可用的）：
+      - 缓存剩余不足 CACHE_REFRESH_MARGIN_DAYS 天（或指定 --refresh）时，
+        先从客户端内存换新 token，让缓存不断向前滚动；
+      - 否则先试本地缓存、再试明文凭据文件；
+      - 都失败则从客户端进程内存提取；
+      - 客户端未运行则尝试自动拉起后重试。
     """
+    if "--refresh" in sys.argv:
+        force_refresh = True
+
     account, domain = read_account_meta()
     uid = account.get("uid")
     if not uid:
@@ -531,46 +614,57 @@ def resolve_credentials():
         nickname = "(已加密)"
     log(f"当前用户: {nickname} (uid: {uid})")
 
-    candidates = []   # [(token, source_desc)]
-    seen = set()
-
-    def push(token, source):
-        if isinstance(token, str) and token and token not in seen:
-            seen.add(token)
-            candidates.append((token, source))
-
     cache = load_token_cache()
-    if cache and cache.get("uid") == uid:
-        push(cache.get("accessToken"), "本地 token 缓存")
+    remaining = cache_remaining_days(cache)
 
+    cache_tokens = []
+    if cache and cache.get("uid") == uid and isinstance(cache.get("accessToken"), str):
+        cache_tokens.append((cache["accessToken"], "本地 token 缓存"))
+
+    file_tokens = []
+    seen = {t for t, _ in cache_tokens}
     for path, session in read_auth_files():
-        auth = session.get("auth") or {}
-        tok = auth.get("accessToken")
-        if isinstance(tok, str) and tok:
-            push(tok, f"凭据文件 {path.name}")
+        tok = (session.get("auth") or {}).get("accessToken")
+        if isinstance(tok, str) and tok and tok not in seen:
+            seen.add(tok)
+            file_tokens.append((tok, f"凭据文件 {path.name}"))
 
-    for token, source in candidates:
-        data = probe_token(token, uid, domain)
-        if data:
-            log(f"token 可用（来源: {source}）")
-            save_token_cache(token, uid, source)
+    if remaining is not None:
+        log(f"缓存 token 剩余 {remaining:.1f} 天")
+
+    near_expiry = remaining is not None and remaining < CACHE_REFRESH_MARGIN_DAYS
+    if force_refresh or near_expiry:
+        reason = "已指定 --refresh" if force_refresh else f"缓存仅剩 {remaining:.1f} 天"
+        log(f"{reason}，尝试从客户端内存获取更新的 token...")
+        hit = _attempt_from_memory(uid, domain)
+        if hit:
+            token, data, source = hit
             return token, uid, domain, data, source
-        log(f"token 不可用（来源: {source}），换下一个", "WARN")
 
-    # 兜底：从客户端进程内存提取
-    log("缓存与凭据文件均无效，尝试从客户端进程内存提取...")
-    for token in scan_client_memory_for_tokens():
-        data = probe_token(token, uid, domain)
-        if data:
-            log("已从客户端内存提取到有效 token")
-            save_token_cache(token, uid, "客户端进程内存")
-            return token, uid, domain, data, "客户端进程内存"
+    hit = _attempt(cache_tokens + file_tokens, uid, domain)
+    if hit:
+        token, data, source = hit
+        return token, uid, domain, data, source
+
+    if not (force_refresh or near_expiry):
+        log("缓存与凭据文件均无效，尝试从客户端进程内存提取...")
+        hit = _attempt_from_memory(uid, domain)
+        if hit:
+            token, data, source = hit
+            return token, uid, domain, data, source
+
+    # 最后一招：拉起客户端后再试一次
+    if try_launch_client():
+        hit = _attempt_from_memory(uid, domain)
+        if hit:
+            token, data, source = hit
+            return token, uid, domain, data, source
 
     log("=" * 50, "ERROR")
     log("无法获得可用的 accessToken。可能原因：", "ERROR")
-    log("  1) WorkBuddy 客户端未运行（内存提取需要客户端在运行）", "ERROR")
+    log("  1) WorkBuddy 客户端未运行或启动失败（内存提取依赖客户端）", "ERROR")
     log("  2) 客户端登录已失效，需要重新登录", "ERROR")
-    log("请打开 WorkBuddy 客户端并确认已登录，然后重试。", "ERROR")
+    log("请手动打开 WorkBuddy 客户端并确认已登录，然后重试。", "ERROR")
     sys.exit(1)
 
 

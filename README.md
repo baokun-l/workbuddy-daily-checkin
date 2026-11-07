@@ -54,6 +54,12 @@
 > 找到可用 token 后写入本地缓存（已加入 `.gitignore`，权限 600）。
 > **第 3 步要求 WorkBuddy 客户端正在运行**；缓存有效期约 2 个月，
 > 期间只要有任意一次运行成功，就会自动续上新 token。
+>
+> **自动续期与自愈**：
+> - 缓存剩余有效期不足 **10 天**时，脚本会优先从客户端内存换一个新 token，让缓存持续向前滚动；
+> - 若所有凭据都失效且客户端未运行，脚本会**尝试自动拉起 WorkBuddy**（可用 `--no-launch` 关闭），
+>   等它初始化后再提取 token；
+> - 想立即换新可运行 `--refresh`。
 
 ### 脚本逻辑
 1. 从本地 auth 文件读取最新的 accessToken（每次运行都读，确保拿到最新 token）
@@ -83,6 +89,12 @@ python workbuddy_checkin.py --status
 
 # 模拟运行（不实际调用领取接口）
 python workbuddy_checkin.py --dry-run
+
+# 强制从客户端内存换一个新 token（缓存临近过期或想立即换新时用）
+python workbuddy_checkin.py --refresh
+
+# 禁止自动拉起客户端（默认在所有凭据失效且客户端未运行时会尝试启动它）
+python workbuddy_checkin.py --no-launch
 ```
 
 ### 设置每天自动执行（Windows 任务计划程序）
