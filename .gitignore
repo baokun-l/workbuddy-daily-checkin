@@ -2,6 +2,10 @@
 checkin.log
 checkin.log.old
 
+# ===== Token cache (SENSITIVE: contains a live access token, never commit) =====
+wb_token_cache.json
+wb_token_cache.json.tmp
+
 # ===== Python cache =====
 __pycache__/
 

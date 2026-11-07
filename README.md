@@ -33,17 +33,27 @@
 - **请求头**: `Authorization: Bearer <token>` + `X-User-Id: <uid>`
 - WorkBuddy 客户端运行时会自动刷新 token 并写回文件
 
-> **凭据来源（2026-09 客户端更新后重要）**
+> **凭据来源（客户端两次加固后的应对）**
 >
-> 新版客户端会把 `workbuddy-desktop.info` 的敏感字段用 AES-GCM 信封加密，
-> 形如 `{"$wbEncrypted":1,"envelope":"..."}`，第三方脚本无法解密。
-> 因此本脚本按优先级读取凭据：
+> 客户端先后两次破坏了第三方读取凭据的方式：
 >
-> 1. `Tencent-Cloud.coding-copilot.info`（同账号、**明文**，CodeBuddy 插件写入）—— 首选
-> 2. `workbuddy-desktop.info`（仅在字段仍为明文时可用）—— 回退
+> 1. 约 2026-09-26：把 `workbuddy-desktop.info` 的敏感字段改成 AES-GCM 信封
+>    `{"$wbEncrypted":1,"envelope":"..."}`，无法解密；
+> 2. 约 2026-10-24：同账号的明文凭据文件 `Tencent-Cloud.coding-copilot.info`
+>    的**服务端会话失效**，此后一直返回 `HTTP 401`（JWT 里写着远期过期时间，
+>    但服务端已不认——自报的 `exp` 不等于服务端会话有效期）。
 >
-> 两者都位于 `%LOCALAPPDATA%/CodeBuddyExtension/Data/Public/auth/`。
-> 若两处都变成加密格式，脚本会给出明确报错，而不是抛出难以理解的异常。
+> 因此脚本按下列顺序逐个**实测**（用状态接口验证），取第一个真正可用的 token：
+>
+> | 顺序 | 来源 | 说明 |
+> |---|---|---|
+> | 1 | `wb_token_cache.json` | 上次成功获取的 token 缓存（命中时秒回） |
+> | 2 | `Tencent-Cloud.coding-copilot.info` | 明文凭据文件，可能已失效 |
+> | 3 | WorkBuddy 客户端进程内存 | 客户端持有解密后的明文 JWT，扫描进程内存提取 |
+>
+> 找到可用 token 后写入本地缓存（已加入 `.gitignore`，权限 600）。
+> **第 3 步要求 WorkBuddy 客户端正在运行**；缓存有效期约 2 个月，
+> 期间只要有任意一次运行成功，就会自动续上新 token。
 
 ### 脚本逻辑
 1. 从本地 auth 文件读取最新的 accessToken（每次运行都读，确保拿到最新 token）
@@ -55,9 +65,11 @@
 
 | 文件 | 说明 |
 |------|------|
-| `workbuddy_checkin.py` | 主脚本，执行签到逻辑 |
+| `workbuddy_checkin.py` | 主脚本，执行签到逻辑（凭据解析 + 状态查询 + 领取） |
 | `run_checkin.bat` | Windows 批处理入口，供任务计划程序调用 |
-| `checkin.log` | 运行日志（自动生成） |
+| `setup_event_trigger.ps1` | 一键注册计划任务（联网即领 + 每日 5 次兜底） |
+| `checkin.log` | 运行日志（自动生成，已 gitignore） |
+| `wb_token_cache.json` | token 缓存（自动生成，**已 gitignore，切勿提交**） |
 
 ## 使用方法
 
@@ -121,8 +133,8 @@ Unregister-ScheduledTask -TaskName "WorkBuddy每日签到" -Confirm:$false
 
 1. **需要先登录**: 首次使用前，必须打开 WorkBuddy 桌面客户端并登录账号，
    这样才会生成 auth 文件。脚本从该文件读取登录凭证。
-   若脚本报「accessToken 已被客户端加密」，说明客户端升级引入了字段加密；
-   此时确认 `Tencent-Cloud.coding-copilot.info` 存在且为明文即可（打开 CodeBuddy 插件会重建它）。
+   若缓存过期且凭据文件失效，脚本会从**客户端进程内存**提取 token，
+   因此该模式下**要求 WorkBuddy 客户端正在运行**；都取不到时会提示你先打开客户端登录。
 
 2. **Token 过期**: accessToken 有效期 60 天。脚本会自动用 refreshToken 刷新。
    但 refreshToken 有效期 90 天，如果超过 90 天没打开 WorkBuddy 客户端，
